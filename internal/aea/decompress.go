@@ -18,11 +18,20 @@ import (
 // recorded in the root header. origSize is the announced size of the plaintext
 // and is used both as the output size and to bound the decompressor.
 func (d *decryptor) decompress(src []byte, origSize int, cluster uint32, seg int) ([]byte, error) {
-	fail := func(err error) ([]byte, error) {
-		return nil, fmt.Errorf("aea: cluster %d segment %d: decompressing (%q): %w",
-			cluster, seg, string(d.root.compression), err)
+	out, err := decompressSegment(d.root.compression, src, origSize)
+	if err != nil {
+		return nil, fmt.Errorf("aea: cluster %d segment %d: %w", cluster, seg, err)
 	}
-	switch d.root.compression {
+	return out, nil
+}
+
+// decompressSegment expands one segment payload with the archive's compression
+// algorithm. origSize is the announced plaintext size and bounds expansion.
+func decompressSegment(compression byte, src []byte, origSize int) ([]byte, error) {
+	fail := func(err error) ([]byte, error) {
+		return nil, fmt.Errorf("decompressing (%q): %w", string(compression), err)
+	}
+	switch compression {
 	case 'e': // LZFSE
 		out, err := lzfse.DecompressLimit(src, origSize)
 		if err != nil {
@@ -107,7 +116,12 @@ func inflateLZMA(src, dst []byte) error {
 // verifyChecksum checks the segment checksum stored in the segment header
 // against the plaintext.
 func (d *decryptor) verifyChecksum(data, want []byte) error {
-	switch d.root.checksum {
+	return verifySegmentChecksum(d.root.checksum, data, want)
+}
+
+// verifySegmentChecksum checks one segment against its stored checksum.
+func verifySegmentChecksum(algorithm byte, data, want []byte) error {
+	switch algorithm {
 	case 0:
 		return nil
 	case 2:

@@ -33,6 +33,7 @@ const usage = `xcfetch - fetch Apple simulator runtimes and Xcode archives off-p
 Usage:
   xcfetch runtime list [flags]            List downloadable simulator runtimes
   xcfetch runtime fetch <version> [flags] Download (and unpack) one simulator runtime
+  xcfetch runtime extract <version>       Extract selected files over HTTP ranges
   xcfetch xcode login [flags]             Sign in with an Apple ID
   xcfetch xcode logout                    Forget the saved session
   xcfetch xcode status                    Show whether the saved session is valid

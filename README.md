@@ -60,6 +60,39 @@ xcfetch runtime fetch 17.5 --dmg-tool hdiutil   # old direct-source runtime
 
 Result: `…/iOS 26.5 Simulator Runtime/<files>/iOS 26.5.simruntime`.
 
+### `runtime extract` — pull single files without the 8 GB download
+
+```
+xcfetch runtime extract 26.5 --match Restore.plist --list     # what is inside
+xcfetch runtime extract 26.5 --path AssetData/Restore/Restore.plist --out ~/x
+xcfetch runtime extract 26.5 --payload 2 --list               # scan one payload only
+```
+
+Everything above is served by HTTP `Range` requests: the AEA header, the cluster
+header blocks, the pbz block headers and only the segments that hold the wanted
+bytes.
+
+**Cost model** (measured, not theoretical):
+
+| Item | Cost |
+|---|---|
+| Startup | AEA prologue + one cluster header block per cluster walked (~18 KB each) |
+| Per wanted file | one AEA segment (1 MiB) + one pbz block (4 MiB) — the granularity floor |
+| Per 4 MiB of *skipped* payload | one AEA segment (1 MiB), because a pbz block's compressed offset can only be learned from the previous block's header |
+| Repeat run | ~0, from the persisted block index (`~/.cache/xcfetch/pbz-index`, or `XCFETCH_CACHE_DIR`) |
+
+Measured against the live iOS 26.5 runtime (8.5 GB asset, `Restore.plist`, 988 B):
+
+| Run | Transferred | Requests | Wall |
+|---|---|---|---|
+| cold (index walk) | 2.0 GiB | 2132 | 2m35s |
+| warm (cached index) | **5.2 MiB** | 102 | 5.4s |
+
+So a file in a small payload costs a few MiB; a file behind the 8 GB disk image
+costs roughly a quarter of that image the first time and almost nothing after.
+`--max-bytes` (default 4 GiB) aborts a runaway walk, `--payload N` skips payloads
+you do not care about, and `--no-index-cache` keeps everything in memory.
+
 ### `xcode login` / `logout` / `status`
 
 Signs in with SRP-6a against `idmsa.apple.com` (SHA-256, RFC 5054 2048-bit
@@ -125,6 +158,7 @@ payload archives rather than a plain file tree.
 | Developer downloads | listing/date decoding, newest-release selection, CDN redirect + `ADCDownloadAuth` cookie, 401 handling |
 | Cookie jar | persistence round-trip, 0600 permissions, expiry filtering, unrelated hosts ignored |
 | CLI | flag/positional reordering, dispatch, usage errors, signed-out guard |
+| Range extraction | HTTP server that counts bytes: random reads agree with a linear decrypt; extracting a 42 KB file from a 96 MiB object transfers a bounded amount; index cache cuts a repeat walk by >4x; budget guard aborts |
 | Index / Pallas | live tests (`XCFETCH_NET_TESTS=1`) against Apple's real services |
 
 Known gaps: federated/SSO Apple IDs and hardware security keys are rejected with

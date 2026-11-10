@@ -7,8 +7,8 @@ func TestHumanBytes(t *testing.T) {
 		in   int64
 		want string
 	}{
-		{0, "-"},
-		{512, "512.0 BiB"},
+		{0, "0 B"},
+		{512, "512 B"},
 		{1024, "1.0 KiB"},
 		{1536, "1.5 KiB"},
 		{8 << 20, "8.0 MiB"},

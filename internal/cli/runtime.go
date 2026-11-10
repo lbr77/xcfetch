@@ -23,6 +23,7 @@ func runtimeUsage(w io.Writer) {
 	fmt.Fprint(w, `Usage:
   xcfetch runtime list [--platform ios] [--beta] [--arch arm64]
   xcfetch runtime fetch <version|build> [flags]
+  xcfetch runtime extract <version|build> --match TEXT [flags]
 
 Flags for fetch:
   --platform ios|watchos|tvos|visionos   platform filter (default ios)
@@ -45,6 +46,8 @@ func runRuntime(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		return runtimeList(ctx, args[1:], stdout, stderr)
 	case "fetch", "download":
 		return runtimeFetch(ctx, args[1:], stdout, stderr)
+	case "extract":
+		return runRuntimeExtract(ctx, args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		runtimeUsage(stdout)
 		return nil
@@ -337,7 +340,7 @@ func usageErr(w io.Writer, format string, args ...any) error {
 }
 
 func humanBytes(n int64) string {
-	if n <= 0 {
+	if n < 0 {
 		return "-"
 	}
 	return humanFloat(float64(n))
@@ -346,13 +349,17 @@ func humanBytes(n int64) string {
 // humanFloat renders a byte count with a binary unit suffix.
 func humanFloat(n float64) string {
 	const unit = 1024
-	units := "BKMGTPE"
-	exp := 0
+	switch {
+	case n < unit:
+		return fmt.Sprintf("%.0f B", n)
+	}
+	units := []string{"KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
+	exp := -1
 	for n >= unit && exp < len(units)-1 {
 		n /= unit
 		exp++
 	}
-	return fmt.Sprintf("%.1f %ciB", n, units[exp])
+	return fmt.Sprintf("%.1f %s", n, units[exp])
 }
 
 // reuseArchive reports whether dest already holds the complete archive.
