@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/libr/xcfetch/internal/session"
+	"github.com/lbr77/xcfetch/internal/session"
 )
 
 // ErrUsage marks command-line mistakes (exit status 2).

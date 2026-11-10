@@ -18,10 +18,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/libr/xcfetch/internal/aa"
-	"github.com/libr/xcfetch/internal/aea"
-	"github.com/libr/xcfetch/internal/pbz"
-	"github.com/libr/xcfetch/internal/remote"
+	"github.com/lbr77/xcfetch/internal/aa"
+	"github.com/lbr77/xcfetch/internal/aea"
+	"github.com/lbr77/xcfetch/internal/pbz"
+	"github.com/lbr77/xcfetch/internal/remote"
 )
 
 // rangeServer serves body with Range support and counts what it sends.

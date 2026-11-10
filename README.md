@@ -27,7 +27,10 @@ on Linux the runtime is only useful as files (frameworks, dyld caches, binaries)
 ## Install
 
 ```sh
-go build -o xcfetch .          # needs Go 1.27+
+go install github.com/lbr77/xcfetch@latest   # needs Go 1.27+
+# or, from a checkout:
+go build -o xcfetch .
+
 # optional, to unpack the runtime disk images on Linux:
 sudo apt install p7zip-full    # 7-Zip >= 22 reads APFS/HFS+ inside .dmg
 ```

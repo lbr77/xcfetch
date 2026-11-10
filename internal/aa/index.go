@@ -8,7 +8,7 @@ import (
 	"io/fs"
 	"sort"
 
-	"github.com/libr/xcfetch/internal/pbz"
+	"github.com/lbr77/xcfetch/internal/pbz"
 )
 
 // TypeDirectory identifies directory entries, for callers that need to skip them.

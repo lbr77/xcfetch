@@ -11,12 +11,12 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/libr/xcfetch/internal/aa"
-	"github.com/libr/xcfetch/internal/aea"
-	"github.com/libr/xcfetch/internal/dmg"
-	"github.com/libr/xcfetch/internal/download"
-	"github.com/libr/xcfetch/internal/pallas"
-	"github.com/libr/xcfetch/internal/runtime"
+	"github.com/lbr77/xcfetch/internal/aa"
+	"github.com/lbr77/xcfetch/internal/aea"
+	"github.com/lbr77/xcfetch/internal/dmg"
+	"github.com/lbr77/xcfetch/internal/download"
+	"github.com/lbr77/xcfetch/internal/pallas"
+	"github.com/lbr77/xcfetch/internal/runtime"
 )
 
 func runtimeUsage(w io.Writer) {

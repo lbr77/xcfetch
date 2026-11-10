@@ -10,10 +10,10 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/libr/xcfetch/internal/adc"
-	"github.com/libr/xcfetch/internal/appleid"
-	"github.com/libr/xcfetch/internal/download"
-	"github.com/libr/xcfetch/internal/session"
+	"github.com/lbr77/xcfetch/internal/adc"
+	"github.com/lbr77/xcfetch/internal/appleid"
+	"github.com/lbr77/xcfetch/internal/download"
+	"github.com/lbr77/xcfetch/internal/session"
 )
 
 func xcodeUsage(w io.Writer) {

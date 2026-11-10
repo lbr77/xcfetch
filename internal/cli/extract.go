@@ -12,11 +12,11 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/libr/xcfetch/internal/aa"
-	"github.com/libr/xcfetch/internal/aea"
-	"github.com/libr/xcfetch/internal/pbz"
-	"github.com/libr/xcfetch/internal/remote"
-	"github.com/libr/xcfetch/internal/runtime"
+	"github.com/lbr77/xcfetch/internal/aa"
+	"github.com/lbr77/xcfetch/internal/aea"
+	"github.com/lbr77/xcfetch/internal/pbz"
+	"github.com/lbr77/xcfetch/internal/remote"
+	"github.com/lbr77/xcfetch/internal/runtime"
 )
 
 // extractUsage documents the on-demand extraction command.

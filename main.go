@@ -8,7 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/libr/xcfetch/internal/cli"
+	"github.com/lbr77/xcfetch/internal/cli"
 )
 
 func main() {

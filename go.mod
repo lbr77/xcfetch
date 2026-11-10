@@ -1,4 +1,4 @@
-module github.com/libr/xcfetch
+module github.com/lbr77/xcfetch
 
 go 1.27.1
 
