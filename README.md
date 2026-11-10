@@ -80,18 +80,34 @@ bytes.
 | Item | Cost |
 |---|---|
 | Startup | AEA prologue + one cluster header block per cluster walked (~18 KB each) |
-| Per wanted file | its own bytes where segments and blocks are stored uncompressed; otherwise one AEA segment (1 MiB) and/or one pbz block (4 MiB) |
-| Per 4 MiB of *skipped* payload | one pbz block header: a few bytes (AES-CTR seeks inside a segment stored uncompressed, and 32 headers are prefetched concurrently), or a whole 1 MiB AEA segment when the header sits in a compressed one |
+| Per wanted file | its own bytes where segments and blocks are stored uncompressed; otherwise one AEA segment (1 MiB) and the compressed prefix of its pbz block up to the wanted bytes |
+| Per 4 MiB of *skipped* payload | one pbz block header, about 1 KiB: AES-CTR seeks inside segments stored uncompressed, headers in compressed segments are inferred (below), and headers are prefetched concurrently |
 | Repeat run | ~0, from the persisted block index (`~/.cache/xcfetch/pbz-index`, or `XCFETCH_CACHE_DIR`) |
 
 Measured against the live iOS 26.5 runtime (8.5 GB asset, `Restore.plist`, 988 B):
 
 | Run | Transferred | Requests | Wall |
 |---|---|---|---|
-| cold (index walk) | 199.8 MiB | 2535 | 20s |
-| warm (cached index) | **5.2 MiB** | 103 | 2.7s |
+| cold (index walk) | 15.1 MiB | 2360 | 11s |
+| warm (cached index) | **1.2 MiB** | 101 | 2.0s |
 
-(Before partial segment reads the cold walk cost 2.0 GiB and 2m35s.)
+(Reading whole segments, the cold walk cost 2.0 GiB and 2m35s.)
+
+**Inferred headers.** A pbz header can sit in an AEA segment that is
+LZFSE-compressed (by a few percent), where reading it would cost the whole
+1 MiB segment. Nearly every block of a payload that is already compressed (the
+disk image) is stored raw at full size, so such a header is not read: the
+block is assumed raw and the assumption is confirmed by the next header that
+is cheap to read, and the one after it, sitting exactly where the guess puts
+them. If a run of assumed blocks fails that check, the last header of the run
+(usually the one compressed block that broke it) is probed for real, which
+confirms the rest. A wrong guess would need payload bytes that spell out a
+valid header, or compressed sizes summing exactly to the raw stride; it would
+shift later offsets and fail the image's structure or seal checks rather than
+produce wrong files. On the iOS 26.5 asset the inferred index is identical to a
+strictly walked one (2,030 blocks, 134 inferred). `--verify-segments` turns
+inference off along with partial reads. Inferred blocks are marked as such in
+the cached index.
 
 So a file in a small payload costs a few MiB; a file behind the 8 GB disk image
 costs a few hundred MiB the first time (see below) and almost nothing after.
@@ -123,7 +139,7 @@ The layers, all read on demand:
 | UDIF (`internal/udif`) | koly trailer, XML block map, then only the runs (LZFSE/zlib/bzip2/LZMA/ADC/raw) holding wanted sectors |
 | APFS (`internal/apfs`) | GPT, newest checkpoint, object maps, the B-tree nodes on each path, the file's extents |
 | AEA | segments stored uncompressed are decrypted in place (AES-CTR seeks), so a 16-byte read costs 16 bytes |
-| pbz | raw blocks are read in place; the header walk prefetches 32 headers ahead while blocks keep coming back raw |
+| pbz | raw blocks are read in place, compressed ones (xz/lzma/zlib) are decoded only up to the wanted bytes; the header walk infers headers in compressed segments and prefetches ahead with a window that doubles (to 128) while guesses hold |
 
 Partial AEA reads cannot be authenticated by the segment MAC (it covers whole
 segments), so every extracted file is instead checked against the sealed
@@ -145,14 +161,13 @@ Measured against the live iOS 26.5 asset (8.5 GB) for the three files above
 
 | Run | Transferred | Requests | Wall |
 |---|---|---|---|
-| cold (pbz index walk) | 209.9 MiB | 2547 | 31s |
-| warm (cached index) | **13.1 MiB** | 113 | 4.5s |
+| cold (pbz index walk) | 23.0 MiB | 2380 | 17s |
+| warm (cached index) | **10.1 MiB** | 122 | 3.0s |
 
 Of the image itself only 18 of 16,241 UDIF runs (2.9 MiB compressed) and 137
-APFS metadata blocks are read. The cold cost is the pbz header walk across the
-8 GB image: 1,988 of its 2,030 blocks are stored raw and their headers cost a
-few bytes each, but 187 AEA segments are LZFSE-compressed by a few percent, and
-a header that falls in one costs the whole 1 MiB segment.
+APFS metadata blocks are read; the rest of the cold cost is the pbz header walk
+across the 8 GB image (2,030 headers). The first version of this path, which
+read every header in a compressed segment, cost 209.9 MiB cold.
 
 ### `xcode login` / `logout` / `status`
 
@@ -223,6 +238,7 @@ payload archives rather than a plain file tree.
 | Disk image run table | logical disk compared byte-for-byte with `hdiutil`'s raw conversion for UDRO, ULFO (LZFSE), UDZO (zlib), UDBZ (bzip2) and ULMO (LZMA) images |
 | APFS | hdiutil-built volume (files, modes, symlinks, case-insensitive lookup, 600-entry directory); the real sealed iOS 26.5 image compared byte-for-byte with its mounted copy, seal hashes covering every byte, a flipped byte rejected (`XCFETCH_TEST_RUNTIME_DMG`/`_MOUNT`) |
 | Partial AEA reads | seekable AES-CTR against a linear decrypt (including a counter carry); random reads of an `aea`-encrypted mix of stored and compressed segments; a 16-byte read costs 16 bytes |
+| pbz walk | raw blocks read in place; compressed blocks decoded only as far as needed; inferred headers equal the true index, expensive headers are read only at run ends (a compressed block, the short final block); the live iOS 26.5 index matches a strict walk block for block |
 | Index / Pallas | live tests (`XCFETCH_NET_TESTS=1`) against Apple's real services |
 
 Known gaps: federated/SSO Apple IDs and hardware security keys are rejected with

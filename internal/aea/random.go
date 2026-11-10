@@ -261,6 +261,36 @@ func (a *RandomReader) readStored(cluster int64, seg int, segOff int64, p []byte
 	return int(n), true, nil
 }
 
+// Expensive reports whether reading n bytes at off would fetch and decompress
+// a whole segment, rather than hit the cache or decrypt the bytes in place.
+// With SetVerifyAll every read authenticates whole segments by choice, so
+// nothing is reported as expensive and callers do not trade that away.
+func (a *RandomReader) Expensive(off int64, n int) bool {
+	if !a.partial || n <= 0 || off < 0 || off >= a.Size() {
+		return false
+	}
+	segSize := int64(a.root.segmentSize)
+	for pos := off; pos < min(off+int64(n), a.Size()); pos = (pos/segSize + 1) * segSize {
+		cluster := pos / a.clusterSpan
+		seg := int(pos % a.clusterSpan / segSize)
+		a.mu.Lock()
+		_, cached := a.segCache[uint64(cluster)<<32|uint64(seg)]
+		a.mu.Unlock()
+		if cached {
+			continue
+		}
+		info, err := a.clusterInfo(cluster)
+		if err != nil {
+			return false // let the read itself report it
+		}
+		hdr := info.hdrs[seg*a.hdrLen:]
+		if binary.LittleEndian.Uint32(hdr[0:]) != binary.LittleEndian.Uint32(hdr[4:]) {
+			return true
+		}
+	}
+	return false
+}
+
 // segmentKey derives (and memoises) the data key of one segment.
 func (a *RandomReader) segmentKey(cluster int64, seg int) dataKey {
 	id := uint64(cluster)<<32 | uint64(seg)

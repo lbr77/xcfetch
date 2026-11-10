@@ -112,3 +112,195 @@ func TestRawBlocksReadInPlace(t *testing.T) {
 		}
 	}
 }
+
+// hintedReader marks chosen offsets as expensive, as an AEA reader does for
+// headers inside compressed segments.
+type hintedReader struct {
+	*countingReaderAt
+	expensive map[int64]bool
+}
+
+func (h *hintedReader) Expensive(off int64, n int) bool { return h.expensive[off] }
+
+// trueHeaders walks a stream the slow way and returns its header offsets.
+func trueHeaders(t *testing.T, stream []byte) []int64 {
+	t.Helper()
+	var offs []int64
+	for pos := int64(12); pos < int64(len(stream)); {
+		offs = append(offs, pos)
+		pos += 16 + int64(binary.BigEndian.Uint64(stream[pos+8:]))
+	}
+	return offs
+}
+
+func TestInferredHeaders(t *testing.T) {
+	const blockSize = 64 << 10
+	plain := make([]byte, 30*blockSize-5000) // 29 full blocks + a short one
+	if _, err := rand.Read(plain); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range []int{10, 11, 20} { // compressible blocks
+		clear(plain[b*blockSize : (b+1)*blockSize])
+	}
+	stream := synthStream(t, plain, blockSize)
+	headers := trueHeaders(t, stream)
+	if len(headers) != 30 {
+		t.Fatalf("fixture has %d blocks", len(headers))
+	}
+	// Expensive: a run of raw headers (3-5), a compressed block's header (10,
+	// must be read), raw blocks after compressed ones (12, 21), and the short
+	// final block (29, must be read).
+	expensive := map[int64]bool{}
+	for _, b := range []int{3, 4, 5, 10, 12, 21, 29} {
+		expensive[headers[b]] = true
+	}
+	mustRead := map[int64]bool{headers[10]: true, headers[29]: true}
+
+	src := &hintedReader{countingReaderAt: &countingReaderAt{r: bytes.NewReader(stream)}, expensive: expensive}
+	r, err := NewReader(src, int64(len(stream)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.SetPrefetch(8)
+	blocks, err := r.Blocks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) != len(headers) {
+		t.Fatalf("indexed %d blocks, want %d", len(blocks), len(headers))
+	}
+	inferred := 0
+	for i, b := range blocks {
+		if b.OuterOffset != headers[i] {
+			t.Fatalf("block %d at %d, want %d", i, b.OuterOffset, headers[i])
+		}
+		if b.Inferred {
+			inferred++
+			if !expensive[b.OuterOffset] {
+				t.Errorf("block %d inferred although its header was cheap", i)
+			}
+		}
+	}
+	if inferred != 5 {
+		t.Errorf("inferred %d headers, want 5 (blocks 3, 4, 5, 12 and 21)", inferred)
+	}
+	for off := range expensive {
+		if src.offs[off] != mustRead[off] {
+			t.Errorf("header at %d read=%v, want %v", off, src.offs[off], mustRead[off])
+		}
+	}
+	got := make([]byte, len(plain))
+	if _, err := r.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatal("plaintext differs after an inferred index")
+	}
+	// The inferred index survives a cache round trip.
+	r2, _ := NewReader(bytes.NewReader(stream), int64(len(stream)))
+	if !r2.Import(r.Export()) {
+		t.Fatal("Import rejected an inferred index")
+	}
+	if b2, _ := r2.Blocks(); len(b2) != len(blocks) {
+		t.Fatalf("reimported index has %d blocks", len(b2))
+	}
+}
+
+// TestCompressedPrefixDecode checks that reading the start of a compressed
+// block decodes (and fetches) only a prefix of it, and that later reads extend
+// the same decode.
+func TestCompressedPrefixDecode(t *testing.T) {
+	const blockSize = 4 << 20
+	plain := make([]byte, blockSize)
+	// Compressible but not trivially: random words from a small alphabet.
+	if _, err := rand.Read(plain); err != nil {
+		t.Fatal(err)
+	}
+	for i := range plain {
+		plain[i] = 'a' + plain[i]%16
+	}
+	stream := synthStream(t, plain, blockSize)
+	if comp := binary.BigEndian.Uint64(stream[12+8:]); comp >= blockSize {
+		t.Fatalf("fixture block is not compressed (%d bytes)", comp)
+	}
+	src := &countingReaderAt{r: bytes.NewReader(stream)}
+	r, err := NewReader(src, int64(len(stream)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := make([]byte, 100)
+	if _, err := r.ReadAt(head, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(head, plain[:100]) {
+		t.Fatal("prefix read returned the wrong bytes")
+	}
+	compSize := int64(len(stream) - 28)
+	if src.bytes > compSize/2 {
+		t.Errorf("reading 100 bytes pulled %d of %d compressed bytes", src.bytes, compSize)
+	}
+	tail := make([]byte, 1000)
+	if _, err := r.ReadAt(tail, blockSize-1000); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(tail, plain[blockSize-1000:]) {
+		t.Fatal("tail read returned the wrong bytes")
+	}
+	mid := make([]byte, 5000)
+	if _, err := r.ReadAt(mid, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(mid, plain[1<<20:1<<20+5000]) {
+		t.Fatal("middle read returned the wrong bytes")
+	}
+}
+
+// TestInferredRunEndingInCompressedBlock covers runs of expensive raw headers
+// that end at a compressed block or at the short final block: one probe of the
+// last header confirms the run, the others are never read.
+func TestInferredRunEndingInCompressedBlock(t *testing.T) {
+	const blockSize = 64 << 10
+	plain := make([]byte, 20*blockSize-7000)
+	if _, err := rand.Read(plain); err != nil {
+		t.Fatal(err)
+	}
+	clear(plain[8*blockSize : 9*blockSize]) // block 8 compresses
+	stream := synthStream(t, plain, blockSize)
+	headers := trueHeaders(t, stream)
+	expensive := map[int64]bool{}
+	for _, b := range []int{4, 5, 6, 7, 8, 16, 17, 18, 19} {
+		expensive[headers[b]] = true
+	}
+	src := &hintedReader{countingReaderAt: &countingReaderAt{r: bytes.NewReader(stream)}, expensive: expensive}
+	r, err := NewReader(src, int64(len(stream)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks, err := r.Blocks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, b := range blocks {
+		if b.OuterOffset != headers[i] {
+			t.Fatalf("block %d at %d, want %d", i, b.OuterOffset, headers[i])
+		}
+	}
+	// Only the run ends (compressed block 8, final block 19) are read.
+	for _, b := range []int{4, 5, 6, 7, 16, 17, 18} {
+		if src.offs[headers[b]] {
+			t.Errorf("expensive header %d was read", b)
+		}
+	}
+	for _, b := range []int{8, 19} {
+		if !src.offs[headers[b]] {
+			t.Errorf("run end %d was not probed", b)
+		}
+	}
+	got := make([]byte, len(plain))
+	if _, err := r.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatal("plaintext differs")
+	}
+}

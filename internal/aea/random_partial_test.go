@@ -115,6 +115,14 @@ func TestRandomReaderPartialReads(t *testing.T) {
 			t.Fatal("small read returned the wrong bytes")
 		}
 		cost := cr.bytes.Load() - before
+		// The cost hint agrees: stored segments are cheap, the compressible
+		// (zero) region is not, unless every read verifies whole segments.
+		if rr.Expensive(300<<10, 16) {
+			t.Error("Expensive reports a stored segment as expensive")
+		}
+		if got := rr.Expensive(1<<20+300<<10, 16); got == verifyAll {
+			t.Errorf("verifyAll=%v: Expensive(compressed segment) = %v", verifyAll, got)
+		}
 		if !verifyAll && cost > 64 {
 			t.Errorf("partial read of 16 bytes pulled %d bytes", cost)
 		}

@@ -21,8 +21,11 @@ import (
 	"github.com/lbr77/xcfetch/internal/udif"
 )
 
-// headerPrefetch is the speculative pbz header window used for remote assets.
-const headerPrefetch = 32
+// headerPrefetch caps the speculative pbz header window for remote assets.
+const headerPrefetch = 128
+
+// smallReadGranule is the remote cache granule for small reads.
+const smallReadGranule = 1 << 10
 
 // extractUsage documents the on-demand extraction command.
 func extractUsage(w io.Writer) {
@@ -54,7 +57,8 @@ Flags:
   --payload N         only scan the N-th container payload (skips the rest)
   --max-bytes N       abort after this much transfer (default 4 GiB, 0 = off)
   --no-index-cache    ignore/persist no block indexes
-  --verify-segments   authenticate whole AEA segments even for small reads
+  --verify-segments   authenticate whole AEA segments even for small reads, and
+                      read every pbz header instead of inferring some
   --verbose           print transfer statistics while working
 
 Example (the tool CoreSimulator uses to build the simulator dyld cache):
@@ -80,7 +84,7 @@ func runRuntimeExtract(ctx context.Context, args []string, stdout, stderr io.Wri
 	maxBytes := fs.Int64("max-bytes", 4<<30, "abort the index walk after this much transfer (0 disables)")
 	noCache := fs.Bool("no-index-cache", false, "do not persist or read block indexes")
 	payloads := fs.Int("payload", 0, "only descend into this 1-based container payload")
-	verifyAll := fs.Bool("verify-segments", false, "authenticate whole AEA segments even for small reads")
+	verifyAll := fs.Bool("verify-segments", false, "authenticate whole AEA segments and read every pbz header")
 
 	rest, err := parse(fs, args)
 	if err != nil {
@@ -139,7 +143,10 @@ func runRuntimeExtract(ctx context.Context, args []string, stdout, stderr io.Wri
 		if err != nil {
 			return err
 		}
-		rs, err := remote.Open(ctx, hc, target.url, remote.Options{})
+		// Most small reads are 16-byte pbz block headers decrypted in place,
+		// so a fine cache granule keeps the walk's transfer close to what it
+		// actually needs.
+		rs, err := remote.Open(ctx, hc, target.url, remote.Options{BlockSize: smallReadGranule})
 		if err != nil {
 			return err
 		}

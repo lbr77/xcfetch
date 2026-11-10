@@ -178,7 +178,7 @@ func indexPath(r io.ReaderAt, size int64, want func(string) bool, out *[]Entry, 
 				}
 				payloadIndex++
 				if opt.wantsPayload(payloadIndex) {
-					view := io.NewSectionReader(r, sr.off, blob.size)
+					view := newView(r, sr.off, blob.size)
 					if err := indexPayload(view, blob.size, sr.off, want, out, depth+1, opt); err != nil {
 						return err
 					}
@@ -255,6 +255,25 @@ func indexPayload(view io.ReaderAt, size, offset int64, want func(string) bool, 
 	default:
 		return nil
 	}
+}
+
+// view is a section of a parent reader that forwards cost hints, so a nested
+// pbz stream can ask the decryption layer which of its header reads would
+// fetch a whole segment.
+type view struct {
+	*io.SectionReader
+	parent io.ReaderAt
+	base   int64
+}
+
+func newView(parent io.ReaderAt, off, n int64) *view {
+	return &view{SectionReader: io.NewSectionReader(parent, off, n), parent: parent, base: off}
+}
+
+// Expensive implements pbz.CostHint by asking the parent, if it knows.
+func (v *view) Expensive(off int64, n int) bool {
+	h, ok := v.parent.(pbz.CostHint)
+	return ok && off >= 0 && off < v.Size() && h.Expensive(v.base+off, n)
 }
 
 // seqReader tracks a position while reading sequentially from a ReaderAt.
