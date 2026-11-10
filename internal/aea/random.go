@@ -34,12 +34,19 @@ type RandomReader struct {
 	headerBytes     int64
 	macBytes        int64
 
+	// partial lets reads of segments stored without compression fetch and
+	// decrypt only the requested bytes (AES-CTR is seekable). The segment MAC
+	// covers the whole segment, so such reads are not authenticated; callers
+	// that need every byte authenticated turn this off.
+	partial bool
+
 	discoverMu sync.Mutex // serialises cluster chain discovery
-	mu         sync.Mutex // guards clusters and the segment cache
+	mu         sync.Mutex // guards clusters, the segment cache and keys
 	clusters   []clusterInfo
 	segCache   map[uint64][]byte
 	segOrder   []uint64
 	cached     int64
+	segKeys    map[uint64]dataKey
 }
 
 // clusterInfo is the parsed header block of one cluster.
@@ -47,8 +54,9 @@ type clusterInfo struct {
 	headerOff   int64
 	payloadOff  int64
 	payloadSize int64
-	hdrs        []byte // decrypted segment headers
-	macs        []byte // next-cluster MAC followed by per-segment MACs
+	hdrs        []byte  // decrypted segment headers
+	macs        []byte  // next-cluster MAC followed by per-segment MACs
+	segOffs     []int64 // absolute offset of each segment's payload
 }
 
 const (
@@ -146,6 +154,8 @@ func NewRandomReader(r io.ReaderAt, size int64, key []byte) (*RandomReader, erro
 		macBytes:        32 + 32*spc,
 		clusters:        make([]clusterInfo, 0, 16),
 		segCache:        make(map[uint64][]byte),
+		segKeys:         make(map[uint64]dataKey),
+		partial:         true,
 	}
 	if a.clusterSpan <= 0 {
 		return nil, fmt.Errorf("aea: implausible cluster span %d", a.clusterSpan)
@@ -155,6 +165,10 @@ func NewRandomReader(r io.ReaderAt, size int64, key []byte) (*RandomReader, erro
 	}
 	return a, nil
 }
+
+// SetVerifyAll makes every read decrypt and authenticate whole segments, even
+// when only a few bytes of an uncompressed segment are wanted.
+func (a *RandomReader) SetVerifyAll(v bool) { a.partial = !v }
 
 // Size is the plaintext size announced by the root header.
 func (a *RandomReader) Size() int64 { return int64(a.root.originalSize) }
@@ -179,6 +193,16 @@ func (a *RandomReader) ReadAt(p []byte, off int64) (int, error) {
 		seg := int(within / int64(a.root.segmentSize))
 		segOff := within % int64(a.root.segmentSize)
 
+		if a.partial {
+			n, ok, err := a.readStored(cluster, seg, segOff, p[read:])
+			if err != nil {
+				return read, err
+			}
+			if ok {
+				read += n
+				continue
+			}
+		}
 		data, err := a.segment(cluster, seg)
 		if err != nil {
 			if err == io.EOF {
@@ -196,6 +220,62 @@ func (a *RandomReader) ReadAt(p []byte, off int64) (int, error) {
 		read += n
 	}
 	return read, nil
+}
+
+// readStored serves a read from a segment stored without compression by
+// fetching and decrypting just the requested bytes. ok is false when the
+// segment is compressed, already cached, or wanted whole (then the verified
+// path costs nothing extra).
+func (a *RandomReader) readStored(cluster int64, seg int, segOff int64, p []byte) (int, bool, error) {
+	if seg < 0 || seg >= int(a.root.segmentsPerCluster) {
+		return 0, false, nil
+	}
+	key := uint64(cluster)<<32 | uint64(seg)
+	a.mu.Lock()
+	_, cached := a.segCache[key]
+	a.mu.Unlock()
+	if cached {
+		return 0, false, nil
+	}
+	info, err := a.clusterInfo(cluster)
+	if err != nil {
+		return 0, false, err
+	}
+	hdr := info.hdrs[seg*a.hdrLen:]
+	origSize := int64(binary.LittleEndian.Uint32(hdr[0:]))
+	compSize := int64(binary.LittleEndian.Uint32(hdr[4:]))
+	if origSize == 0 || compSize != origSize || segOff >= origSize {
+		return 0, false, nil
+	}
+	n := min(int64(len(p)), origSize-segOff)
+	if segOff == 0 && n == origSize {
+		return 0, false, nil
+	}
+	buf := p[:n]
+	if _, err := readFullAt(a.src, buf, info.segOffs[seg]+segOff); err != nil {
+		return 0, false, fmt.Errorf("aea: cluster %d segment %d: reading data: %w", cluster, seg, err)
+	}
+	if err := a.segmentKey(cluster, seg).decryptAt(buf, buf, segOff); err != nil {
+		return 0, false, fmt.Errorf("aea: cluster %d segment %d: decrypting: %w", cluster, seg, err)
+	}
+	return int(n), true, nil
+}
+
+// segmentKey derives (and memoises) the data key of one segment.
+func (a *RandomReader) segmentKey(cluster int64, seg int) dataKey {
+	id := uint64(cluster)<<32 | uint64(seg)
+	a.mu.Lock()
+	k, ok := a.segKeys[id]
+	a.mu.Unlock()
+	if ok {
+		return k
+	}
+	clusterKey := deriveKey(macKeySize, a.mainKey, nil, indexedInfo("AEA_CK", uint32(cluster)))
+	k = dataKey(deriveKey(a.keyLen, clusterKey, nil, indexedInfo("AEA_SK", uint32(seg))))
+	a.mu.Lock()
+	a.segKeys[id] = k
+	a.mu.Unlock()
+	return k
 }
 
 // segment returns the decrypted, checksum-verified plaintext of one segment.
@@ -223,17 +303,12 @@ func (a *RandomReader) segment(cluster int64, seg int) ([]byte, error) {
 		return nil, io.EOF
 	}
 
-	payloadOff := info.payloadOff
-	for i := 0; i < seg; i++ {
-		payloadOff += int64(binary.LittleEndian.Uint32(info.hdrs[i*a.hdrLen+4:]))
-	}
 	cipher := make([]byte, compSize)
-	if _, err := readFullAt(a.src, cipher, payloadOff); err != nil {
+	if _, err := readFullAt(a.src, cipher, info.segOffs[seg]); err != nil {
 		return nil, fmt.Errorf("aea: cluster %d segment %d: reading data: %w", cluster, seg, err)
 	}
 
-	clusterKey := deriveKey(macKeySize, a.mainKey, nil, indexedInfo("AEA_CK", uint32(cluster)))
-	segKey := dataKey(deriveKey(a.keyLen, clusterKey, nil, indexedInfo("AEA_SK", uint32(seg))))
+	segKey := a.segmentKey(cluster, seg)
 	segMAC := info.macs[32+32*seg : 32+32*seg+32]
 	if !segKey.verify(segMAC, cipher, nil) {
 		return nil, fmt.Errorf("aea: cluster %d segment %d: MAC mismatch (corrupted archive)", cluster, seg)
@@ -334,16 +409,20 @@ func (a *RandomReader) readCluster(index, off, prevHeaderOff int64) (clusterInfo
 	if err := chekKey.decryptInto(hdrs, enc); err != nil {
 		return clusterInfo{}, fmt.Errorf("aea: cluster %d: decrypting segment headers: %w", index, err)
 	}
+	payloadOff := off + a.headerBytes + a.macBytes
+	segOffs := make([]int64, a.root.segmentsPerCluster)
 	var payloadSize int64
 	for i := 0; i < int(a.root.segmentsPerCluster); i++ {
+		segOffs[i] = payloadOff + payloadSize
 		payloadSize += int64(binary.LittleEndian.Uint32(hdrs[i*a.hdrLen+4:]))
 	}
 	return clusterInfo{
 		headerOff:   off,
-		payloadOff:  off + a.headerBytes + a.macBytes,
+		payloadOff:  payloadOff,
 		payloadSize: payloadSize,
 		hdrs:        hdrs,
 		macs:        macs,
+		segOffs:     segOffs,
 	}, nil
 }
 

@@ -309,12 +309,13 @@ func TestExtractBudgetGuard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plain, err := aea.NewRandomReader(src, src.Size(), fx.key)
+	// Like the CLI, cap what is pulled from the network.
+	capped := &budget{src: src, limit: 64 << 10}
+	plain, err := aea.NewRandomReader(capped, src.Size(), fx.key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	capped := &budget{src: plain, limit: 64 << 10}
-	_, err = aa.IndexStreamWith(capped, plain.Size(), func(p string) bool {
+	_, err = aa.IndexStreamWith(plain, plain.Size(), func(p string) bool {
 		return strings.Contains(p, "Restore.plist")
 	}, aa.IndexOptions{})
 	if err == nil {
@@ -384,7 +385,7 @@ func TestExtractIndexCacheIsReusable(t *testing.T) {
 	cache := pbz.FileCache{Dir: t.TempDir()}
 	want := func(p string) bool { return strings.HasSuffix(p, "Restore.plist") }
 
-	walk := func() (int64, int) {
+	walk := func() (int64, int64, int) {
 		rs := newRangeServer(t, body)
 		src, err := remote.Open(context.Background(), rs.server.Client(), rs.server.URL, remote.Options{})
 		if err != nil {
@@ -400,17 +401,21 @@ func TestExtractIndexCacheIsReusable(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return rs.bytes.Load(), len(entries)
+		return rs.bytes.Load(), rs.requests.Load(), len(entries)
 	}
 
-	first, n1 := walk()
-	second, n2 := walk()
-	t.Logf("first walk %d bytes, second walk %d bytes, entries %d/%d", first, second, n1, n2)
+	first, firstReqs, n1 := walk()
+	second, secondReqs, n2 := walk()
+	t.Logf("first walk %d bytes/%d requests, second walk %d bytes/%d requests, entries %d/%d",
+		first, firstReqs, second, secondReqs, n1, n2)
 	if n1 != n2 || n1 == 0 {
 		t.Fatalf("entry counts differ: %d vs %d", n1, n2)
 	}
-	if second > first/4 {
-		t.Errorf("cached walk fetched %d bytes vs %d uncached; the index cache is not being used", second, first)
+	// Header reads are small now, so the bytes of both walks are dominated by
+	// the segment holding the wanted entry; the cache shows in the requests.
+	if secondReqs > firstReqs/4 || second > first {
+		t.Errorf("cached walk made %d requests (%d bytes) vs %d (%d bytes) uncached; the index cache is not being used",
+			secondReqs, second, firstReqs, first)
 	}
 }
 

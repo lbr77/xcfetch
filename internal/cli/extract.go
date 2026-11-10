@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"text/tabwriter"
 	"time"
 
@@ -17,30 +18,48 @@ import (
 	"github.com/lbr77/xcfetch/internal/pbz"
 	"github.com/lbr77/xcfetch/internal/remote"
 	"github.com/lbr77/xcfetch/internal/runtime"
+	"github.com/lbr77/xcfetch/internal/udif"
 )
+
+// headerPrefetch is the speculative pbz header window used for remote assets.
+const headerPrefetch = 32
 
 // extractUsage documents the on-demand extraction command.
 func extractUsage(w io.Writer) {
 	fmt.Fprint(w, `Usage:
   xcfetch runtime extract <version|build> --match SUBSTRING [flags]
-  xcfetch runtime extract --local FILE [--key BASE64] --match SUBSTRING [flags]
+  xcfetch runtime extract <version|build> --image PATH [flags]
+  xcfetch runtime extract --local FILE [--key BASE64] (--match S | --image PATH) [flags]
 
 Extracts selected files from a runtime archive using HTTP range requests: only
 the AEA segment headers, pbz block headers and the segments holding the wanted
 bytes are fetched, so pulling a 1 KB plist from an 8 GB asset costs megabytes
 rather than gigabytes.
 
+--image reaches into the runtime's disk image (AssetData/Restore/*.dmg): the
+UDIF run table, the APFS metadata on the path to each file and the file's own
+blocks are read, nothing else. Each path component may be a glob (*, ?, [..])
+and {a,b} expands to alternatives. A directory is extracted recursively (or
+listed, with --list). On sealed volumes every file is checked against the
+volume's own SHA-256 data hashes.
+
 Flags:
-  --match SUBSTRING   only entries whose path contains this text (repeatable)
-  --path PATH         exact entry path (repeatable)
+  --match SUBSTRING   only archive entries whose path contains this text (repeatable)
+  --path PATH         exact archive entry path (repeatable)
+  --image PATH        path inside the runtime disk image's volume (repeatable)
   --list              list the matching entries instead of writing them
   --out DIR           destination (default ~/Downloads/<runtime name>)
-  --local FILE        read a local archive instead of the network
+  --local FILE        read a local archive (or a .dmg, with --image) instead of the network
   --key BASE64        AEA symmetric key for --local archives
   --payload N         only scan the N-th container payload (skips the rest)
-  --max-bytes N       abort the walk after this much transfer (default 4 GiB, 0 = off)
+  --max-bytes N       abort after this much transfer (default 4 GiB, 0 = off)
   --no-index-cache    ignore/persist no block indexes
+  --verify-segments   authenticate whole AEA segments even for small reads
   --verbose           print transfer statistics while working
+
+Example (the tool CoreSimulator uses to build the simulator dyld cache):
+  xcfetch runtime extract 26.5 --image \
+    'Library/Developer/CoreSimulator/Profiles/Runtimes/*.simruntime/Contents/Resources/{update_dyld_sim_shared_cache,dylib-order.txt,dirty-data-segments-order.txt}'
 `)
 }
 
@@ -48,8 +67,10 @@ func runRuntimeExtract(ctx context.Context, args []string, stdout, stderr io.Wri
 	fs := newFlagSet("runtime extract", stderr)
 	var matches multiFlag
 	var paths multiFlag
+	var images multiFlag
 	fs.Var(&matches, "match", "substring of the entry path (repeatable)")
 	fs.Var(&paths, "path", "exact entry path (repeatable)")
+	fs.Var(&images, "image", "path or glob inside the runtime disk image (repeatable)")
 	listOnly := fs.Bool("list", false, "list matching entries without extracting")
 	out := fs.String("out", "", "destination directory")
 	local := fs.String("local", "", "read a local archive instead of the network")
@@ -59,13 +80,14 @@ func runRuntimeExtract(ctx context.Context, args []string, stdout, stderr io.Wri
 	maxBytes := fs.Int64("max-bytes", 4<<30, "abort the index walk after this much transfer (0 disables)")
 	noCache := fs.Bool("no-index-cache", false, "do not persist or read block indexes")
 	payloads := fs.Int("payload", 0, "only descend into this 1-based container payload")
+	verifyAll := fs.Bool("verify-segments", false, "authenticate whole AEA segments even for small reads")
 
 	rest, err := parse(fs, args)
 	if err != nil {
 		return err
 	}
-	if len(matches) == 0 && len(paths) == 0 {
-		return usageErr(stderr, "runtime extract: give at least one --match or --path")
+	if len(matches) == 0 && len(paths) == 0 && len(images) == 0 {
+		return usageErr(stderr, "runtime extract: give at least one --match, --path or --image")
 	}
 	if *local == "" && len(rest) != 1 {
 		return usageErr(stderr, "runtime extract: expected one version, build or identifier (or --local FILE)")
@@ -79,6 +101,7 @@ func runRuntimeExtract(ctx context.Context, args []string, stdout, stderr io.Wri
 		destName string
 		cacheKey string
 		stats    func() remote.Stats
+		isRemote bool
 	)
 	if *local != "" {
 		f, err := os.Open(*local)
@@ -128,8 +151,30 @@ func runRuntimeExtract(ctx context.Context, args []string, stdout, stderr io.Wri
 		src, size, key = body, rs.Size(), target.key
 		destName = rt.Name
 		stats = rs.Stats
+		isRemote = true
 		fmt.Fprintf(stdout, "%s %s (%s, %s)\n  %s\n", rt.PlatformName(), rt.DisplayVersion(),
 			rt.SimulatorVersion.BuildUpdate, humanBytes(size), target.url)
+	}
+
+	dest := *out
+	if dest == "" {
+		dest = filepath.Join(defaultDownloadDir(), sanitizeFilename(destName))
+	}
+	imgOpts := imageOptions{
+		patterns: images,
+		list:     *listOnly,
+		dest:     dest,
+		verbose:  *verbose,
+		stdout:   stdout,
+		stderr:   stderr,
+	}
+
+	// A local disk image has no archive layers at all.
+	if *local != "" && udif.IsUDIF(src, size) {
+		if len(images) == 0 {
+			return usageErr(stderr, "runtime extract: %s is a disk image; select files with --image", *local)
+		}
+		return extractFromImages([]imageSource{{name: filepath.Base(*local), r: src, size: size}}, imgOpts)
 	}
 
 	// Decrypt on demand when the object is an AEA archive.
@@ -139,19 +184,24 @@ func runRuntimeExtract(ctx context.Context, args []string, stdout, stderr io.Wri
 		if err != nil {
 			return err
 		}
+		rr.SetVerifyAll(*verifyAll)
 		plainSrc, plainSize = rr, rr.Size()
 	}
 
 	sel := selector(matches, paths)
+	wantImages := len(images) > 0
 	want := func(p string) bool {
 		if sel != nil && sel(p) {
 			return true
 		}
-		return false
+		return wantImages && isDiskImagePath(p)
 	}
 	opts := aa.IndexOptions{}
 	if *payloads > 0 {
 		opts.Payloads = []int{*payloads}
+	}
+	if isRemote {
+		opts.Prefetch = headerPrefetch
 	}
 	if !*noCache {
 		dir, err := indexCacheDir()
@@ -160,26 +210,74 @@ func runRuntimeExtract(ctx context.Context, args []string, stdout, stderr io.Wri
 			opts.KeyPrefix = cacheKey
 		}
 	}
+	start := time.Now()
 	entries, err := aa.IndexStreamWith(plainSrc, plainSize, want, opts)
 	if err != nil {
 		return err
 	}
-	if len(entries) == 0 {
-		// A path that is not in the archive may live inside the runtime's disk
-		// image; say so instead of failing vaguely.
-		for _, e := range entries {
-			_ = e
+
+	// Split what the walk found into archive entries the caller selected and
+	// disk images to look inside.
+	var (
+		selected []aa.Entry
+		files    int
+		disks    []imageSource
+	)
+	for _, e := range entries {
+		if wantImages && e.Type != aa.TypeDirectory && isDiskImagePath(e.Path) && e.Size > 0 {
+			disks = append(disks, imageSource{
+				name: e.Path,
+				r:    io.NewSectionReader(e.Parent(), e.DataOffset(), e.Size),
+				size: e.Size,
+			})
 		}
-		for _, p := range paths {
-			if strings.Contains(p, "/") {
-				return fmt.Errorf("runtime extract: %q is not an archive entry; files inside the "+
-					"runtime disk image need the whole image (use `xcfetch runtime fetch`)", p)
+		if sel == nil {
+			continue
+		}
+		if e.Type == aa.TypeDirectory || sel(e.Path) {
+			selected = append(selected, e)
+			if e.Type != aa.TypeDirectory {
+				files++
 			}
 		}
-		return fmt.Errorf("runtime extract: no entries matched")
+	}
+	if *verbose {
+		fmt.Fprintf(stderr, "  archive walk: %d entries in %s\n", len(entries), time.Since(start).Round(time.Millisecond))
+		reportStats(stats, true, stderr)
 	}
 
-	if *listOnly {
+	if sel != nil {
+		if files == 0 {
+			for _, p := range paths {
+				if strings.Contains(p, "/") && !wantImages {
+					return fmt.Errorf("runtime extract: %q is not an archive entry; for files inside the "+
+						"runtime disk image use --image %q", p, p)
+				}
+			}
+			if !wantImages {
+				return fmt.Errorf("runtime extract: no entries matched")
+			}
+			fmt.Fprintln(stderr, "runtime extract: no archive entries matched --match/--path")
+		} else if err := emitArchiveEntries(selected, *listOnly, dest, *verbose, stdout, stderr); err != nil {
+			return err
+		}
+	}
+
+	if wantImages {
+		if len(disks) == 0 {
+			return errors.New("runtime extract: the archive contains no disk image to look into")
+		}
+		if err := extractFromImages(disks, imgOpts); err != nil {
+			return err
+		}
+	}
+	reportStats(stats, true, stdout)
+	return nil
+}
+
+// emitArchiveEntries lists or writes the selected archive entries.
+func emitArchiveEntries(entries []aa.Entry, listOnly bool, dest string, verbose bool, stdout, stderr io.Writer) error {
+	if listOnly {
 		w := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(w, "TYPE\tSIZE\tPATH")
 		var total int64
@@ -191,23 +289,17 @@ func runRuntimeExtract(ctx context.Context, args []string, stdout, stderr io.Wri
 			return err
 		}
 		fmt.Fprintf(stdout, "%d entries, %s total\n", len(entries), humanBytes(total))
-		reportStats(stats, verbose != nil && *verbose, stdout)
 		return nil
-	}
-
-	dest := *out
-	if dest == "" {
-		dest = filepath.Join(defaultDownloadDir(), sanitizeFilename(destName))
 	}
 	start := time.Now()
 	if err := aa.ExtractEntries(dest, entries, func(written int64) {
-		if *verbose {
+		if verbose {
 			fmt.Fprintf(stderr, "\r  extracted %s", humanBytes(written))
 		}
 	}); err != nil {
 		return err
 	}
-	if *verbose {
+	if verbose {
 		fmt.Fprintln(stderr)
 	}
 	for _, e := range entries {
@@ -216,7 +308,6 @@ func runRuntimeExtract(ctx context.Context, args []string, stdout, stderr io.Wri
 		}
 	}
 	fmt.Fprintf(stdout, "extracted %d entries in %s\n", len(entries), time.Since(start).Round(time.Millisecond))
-	reportStats(stats, true, stdout)
 	return nil
 }
 
@@ -248,6 +339,11 @@ func selector(matches, paths []string) func(string) bool {
 	}
 }
 
+// isDiskImagePath reports whether an archive entry looks like a disk image.
+func isDiskImagePath(p string) bool {
+	return strings.HasSuffix(strings.ToLower(p), ".dmg")
+}
+
 // isAEA reports whether the object starts with the AEA magic.
 func isAEA(src io.ReaderAt) bool {
 	head := make([]byte, 4)
@@ -270,20 +366,27 @@ func (m *multiFlag) Set(v string) error {
 // ErrBudgetExceeded reports that the index walk hit its transfer budget.
 var ErrBudgetExceeded = errors.New("runtime extract: transfer budget exceeded")
 
-// budget caps how much an archive walk may pull from the network.
+// budget caps how much an archive walk may pull from the network. Reads may
+// arrive concurrently (speculative header prefetch).
 type budget struct {
 	src   io.ReaderAt
 	limit int64
-	read  int64
+	read  atomic.Int64
 }
 
+// ReadAt refuses a read that would cross the limit instead of performing it
+// and reporting afterwards: callers that got all their bytes treat a trailing
+// error as success, so the guard has to fail the read itself.
 func (b *budget) ReadAt(p []byte, off int64) (int, error) {
-	n, err := b.src.ReadAt(p, off)
-	b.read += int64(n)
-	if b.read > b.limit {
-		return n, fmt.Errorf("%w (%s of %s); raise --max-bytes, narrow --path, "+
+	if total := b.read.Add(int64(len(p))); total > b.limit {
+		b.read.Add(-int64(len(p)))
+		return 0, fmt.Errorf("%w (%s of %s); raise --max-bytes, narrow --path, "+
 			"or rerun to resume from the cached block index", ErrBudgetExceeded,
-			humanBytes(b.read), humanBytes(b.limit))
+			humanBytes(total), humanBytes(b.limit))
+	}
+	n, err := b.src.ReadAt(p, off)
+	if n < len(p) {
+		b.read.Add(int64(n - len(p)))
 	}
 	return n, err
 }
@@ -299,7 +402,3 @@ func indexCacheDir() (string, error) {
 	}
 	return filepath.Join(base, "xcfetch", "pbz-index"), nil
 }
-
-// extractFromImage pulls paths out of an APFS volume inside a disk image entry,
-// reading only the blocks on the path to each file. It returns the paths it
-// could not find.

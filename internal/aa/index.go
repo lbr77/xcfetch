@@ -78,6 +78,9 @@ type IndexOptions struct {
 	// payload indexes. It lets a caller skip payloads it does not care about
 	// instead of paying for their block chains.
 	Payloads []int
+	// Prefetch is the speculative header window for nested pbz streams (see
+	// pbz.Reader.SetPrefetch); worth setting when the source is remote.
+	Prefetch int
 }
 
 func (o IndexOptions) wantsPayload(index int) bool {
@@ -230,6 +233,7 @@ func indexPayload(view io.ReaderAt, size, offset int64, want func(string) bool, 
 		if err != nil {
 			return err
 		}
+		pr.SetPrefetch(opt.Prefetch)
 		key := ""
 		if opt.Cache != nil {
 			key = fmt.Sprintf("%s|%d|%d", opt.KeyPrefix, offset, size)
