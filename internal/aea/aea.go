@@ -233,6 +233,40 @@ func (k dataKey) decryptInto(dst, src []byte) error {
 	return nil
 }
 
+// decryptAt decrypts src, which starts at byte off of a segment's ciphertext,
+// into dst. AES-CTR is seekable: the keystream for byte off starts at counter
+// IV + off/16 (a 128-bit big-endian add, as cipher.NewCTR increments it).
+func (k dataKey) decryptAt(dst, src []byte, off int64) error {
+	if len(k) == macKeySize {
+		copy(dst, src)
+		return nil
+	}
+	if off < 0 {
+		return fmt.Errorf("aes: negative offset %d", off)
+	}
+	block, err := aes.NewCipher(k[32:64])
+	if err != nil {
+		return fmt.Errorf("aes: %w", err)
+	}
+	var iv [16]byte
+	copy(iv[:], k[64:80])
+	hi, lo := binary.BigEndian.Uint64(iv[:8]), binary.BigEndian.Uint64(iv[8:])
+	n := uint64(off / 16)
+	if lo+n < lo {
+		hi++
+	}
+	lo += n
+	binary.BigEndian.PutUint64(iv[:8], hi)
+	binary.BigEndian.PutUint64(iv[8:], lo)
+	stream := cipher.NewCTR(block, iv[:])
+	if skip := int(off % 16); skip > 0 {
+		var junk [16]byte
+		stream.XORKeyStream(junk[:skip], junk[:skip])
+	}
+	stream.XORKeyStream(dst, src)
+	return nil
+}
+
 // deriveKey runs HKDF-SHA256 with the given salt and info.
 func deriveKey(n int, ikm, salt, info []byte) []byte {
 	out := make([]byte, n)

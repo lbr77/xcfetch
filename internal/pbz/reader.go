@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 
 	"github.com/go-compressions/lzfse"
@@ -56,6 +57,33 @@ type Reader struct {
 	next   int64 // parent offset of the next block to index
 	plain  int64 // plaintext bytes covered by indexed blocks
 	done   bool
+
+	// prefetch is the speculative window of the header walk (0 disables).
+	prefetch int
+	spec     map[int64]bool // header offsets already requested speculatively
+
+	decMu    sync.Mutex
+	decCache map[int64][]byte // decoded compressed blocks, by OuterOffset
+	decOrder []int64
+}
+
+// decCacheBlocks bounds the decoded-block cache.
+const decCacheBlocks = 8
+
+// prefetchWorkers bounds concurrent speculative header reads.
+const prefetchWorkers = 16
+
+// SetPrefetch makes the header walk read up to n block headers ahead,
+// concurrently, assuming the blocks are stored raw (full size, uncompressed).
+// Each header names the next one's offset, so walking an index costs one round
+// trip per block; on a remote parent that dominates. Already-compressed data
+// (a disk image of LZFSE chunks, say) is stored raw, so the guess holds and the
+// sequential walk then hits warm caches. Speculation only runs while the walk
+// keeps seeing raw blocks, so compressible streams do not pay for misses.
+func (r *Reader) SetPrefetch(n int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.prefetch = n
 }
 
 // NewReader reads the stream header and prepares an index.
@@ -118,6 +146,7 @@ func (r *Reader) indexOne() error {
 		r.done = true
 		return nil
 	}
+	r.speculate()
 	hdr := make([]byte, 16)
 	n, err := r.src.ReadAt(hdr, r.next)
 	if err != nil && !(err == io.EOF && n == len(hdr)) {
@@ -151,6 +180,45 @@ func (r *Reader) indexOne() error {
 	return nil
 }
 
+// speculate warms the parent's caches for the next headers, assuming raw
+// blocks. It must be called with r.mu held; it reads r.src directly.
+func (r *Reader) speculate() {
+	if r.prefetch <= 0 || len(r.blocks) == 0 || r.spec[r.next] {
+		return
+	}
+	if last := r.blocks[len(r.blocks)-1]; last.CompSize != last.PlainSize {
+		return
+	}
+	if r.spec == nil {
+		r.spec = make(map[int64]bool)
+	}
+	stride := 16 + r.blockMax
+	var offs []int64
+	for i := 0; i < r.prefetch; i++ {
+		off := r.next + int64(i)*stride
+		if off+16 > r.size {
+			break
+		}
+		r.spec[off] = true
+		if i > 0 {
+			offs = append(offs, off)
+		}
+	}
+	sem := make(chan struct{}, prefetchWorkers)
+	var wg sync.WaitGroup
+	for _, off := range offs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(off int64) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			var hdr [16]byte
+			_, _ = r.src.ReadAt(hdr[:], off) // a miss only costs the guess
+		}(off)
+	}
+	wg.Wait()
+}
+
 // ensure indexes enough blocks to cover plaintext offset.
 func (r *Reader) ensure(off int64) error {
 	r.mu.Lock()
@@ -163,29 +231,37 @@ func (r *Reader) ensure(off int64) error {
 	return nil
 }
 
-// ReadAt implements io.ReaderAt over the decompressed stream.
+// ReadAt implements io.ReaderAt over the decompressed stream. Raw blocks are
+// read in place, so a small read of a raw block costs only its own bytes.
 func (r *Reader) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, io.EOF
 	}
-	if err := r.ensure(off); err != nil {
-		return 0, err
-	}
 	read := 0
 	for read < len(p) {
 		pos := off + int64(read)
-		block, ok, err := r.blockAt(pos)
-		if err != nil {
-			return read, err
-		}
+		block, ok := r.blockAt(pos)
 		if !ok {
-			return read, io.EOF
-		}
-		data, err := r.decode(block)
-		if err != nil {
-			return read, err
+			if err := r.ensure(pos); err != nil {
+				return read, err
+			}
+			if block, ok = r.blockAt(pos); !ok {
+				return read, io.EOF
+			}
 		}
 		within := pos - block.PlainOffset
+		if block.CompSize == block.PlainSize {
+			n := int(min(int64(len(p)-read), block.PlainSize-within))
+			if _, err := readFullAt(r.src, p[read:read+n], block.DataOffset+within); err != nil {
+				return read, fmt.Errorf("pbz: raw block at %d: %w", block.OuterOffset, err)
+			}
+			read += n
+			continue
+		}
+		data, err := r.decoded(block)
+		if err != nil {
+			return read, err
+		}
 		n := copy(p[read:], data[within:])
 		if n == 0 {
 			return read, io.EOF
@@ -196,15 +272,44 @@ func (r *Reader) ReadAt(p []byte, off int64) (int, error) {
 }
 
 // blockAt finds the indexed block containing plaintext offset pos.
-func (r *Reader) blockAt(pos int64) (Block, bool, error) {
+func (r *Reader) blockAt(pos int64) (Block, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, b := range r.blocks {
-		if pos >= b.PlainOffset && pos < b.PlainOffset+b.PlainSize {
-			return b, true, nil
+	i := sort.Search(len(r.blocks), func(i int) bool {
+		return r.blocks[i].PlainOffset+r.blocks[i].PlainSize > pos
+	})
+	if i < len(r.blocks) && pos >= r.blocks[i].PlainOffset {
+		return r.blocks[i], true
+	}
+	return Block{}, false
+}
+
+// decoded returns a compressed block's plaintext, from a small cache.
+func (r *Reader) decoded(b Block) ([]byte, error) {
+	r.decMu.Lock()
+	if data, ok := r.decCache[b.OuterOffset]; ok {
+		r.decMu.Unlock()
+		return data, nil
+	}
+	r.decMu.Unlock()
+	data, err := r.decode(b)
+	if err != nil {
+		return nil, err
+	}
+	r.decMu.Lock()
+	defer r.decMu.Unlock()
+	if r.decCache == nil {
+		r.decCache = make(map[int64][]byte)
+	}
+	if _, ok := r.decCache[b.OuterOffset]; !ok {
+		r.decCache[b.OuterOffset] = data
+		r.decOrder = append(r.decOrder, b.OuterOffset)
+		for len(r.decOrder) > decCacheBlocks {
+			delete(r.decCache, r.decOrder[0])
+			r.decOrder = r.decOrder[1:]
 		}
 	}
-	return Block{}, false, nil
+	return data, nil
 }
 
 // decode fetches and expands one block.
