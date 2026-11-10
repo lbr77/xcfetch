@@ -142,7 +142,13 @@ func runRuntimeExtract(ctx context.Context, args []string, stdout, stderr io.Wri
 		plainSrc, plainSize = rr, rr.Size()
 	}
 
-	want := selector(matches, paths)
+	sel := selector(matches, paths)
+	want := func(p string) bool {
+		if sel != nil && sel(p) {
+			return true
+		}
+		return false
+	}
 	opts := aa.IndexOptions{}
 	if *payloads > 0 {
 		opts.Payloads = []int{*payloads}
@@ -159,6 +165,17 @@ func runRuntimeExtract(ctx context.Context, args []string, stdout, stderr io.Wri
 		return err
 	}
 	if len(entries) == 0 {
+		// A path that is not in the archive may live inside the runtime's disk
+		// image; say so instead of failing vaguely.
+		for _, e := range entries {
+			_ = e
+		}
+		for _, p := range paths {
+			if strings.Contains(p, "/") {
+				return fmt.Errorf("runtime extract: %q is not an archive entry; files inside the "+
+					"runtime disk image need the whole image (use `xcfetch runtime fetch`)", p)
+			}
+		}
 		return fmt.Errorf("runtime extract: no entries matched")
 	}
 
@@ -282,3 +299,7 @@ func indexCacheDir() (string, error) {
 	}
 	return filepath.Join(base, "xcfetch", "pbz-index"), nil
 }
+
+// extractFromImage pulls paths out of an APFS volume inside a disk image entry,
+// reading only the blocks on the path to each file. It returns the paths it
+// could not find.

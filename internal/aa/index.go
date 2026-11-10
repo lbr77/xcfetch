@@ -27,6 +27,12 @@ type Entry struct {
 	off int64
 }
 
+// DataOffset is the entry's data position inside its parent view.
+func (e Entry) DataOffset() int64 { return e.off }
+
+// Parent returns the reader the entry's data lives in.
+func (e Entry) Parent() io.ReaderAt { return e.src }
+
 // Reader returns the entry's contents on demand.
 func (e Entry) Reader() io.Reader {
 	return io.NewSectionReader(e.src, e.off, e.Size)

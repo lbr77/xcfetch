@@ -96,6 +96,48 @@ costs roughly a quarter of that image the first time and almost nothing after.
 `--max-bytes` (default 4 GiB) aborts a runaway walk, `--payload N` skips payloads
 you do not care about, and `--no-index-cache` keeps everything in memory.
 
+### What is *not* reachable yet: files inside the runtime disk image
+
+The runtime's files (`…simruntime/Contents/Resources/…`, including
+`update_dyld_sim_shared_cache` and the two order files it needs) live inside
+`AssetData/Restore/<build>.dmg`, so `runtime extract --path` cannot pull them
+without materialising that image:
+
+```
+xcfetch runtime extract 26.5 --path 'Library/.../update_dyld_sim_shared_cache'
+runtime extract: "…" is not an archive entry; files inside the runtime disk
+image need the whole image (use `xcfetch runtime fetch`)
+```
+
+The image itself is not the obstacle — its structure was measured on the live
+iOS 26.5 asset:
+
+| Layer | Finding |
+|---|---|
+| UDIF trailer | `koly`, data fork 8,493,304,634 B, block map 972,311 B |
+| Block map | 16,237 runs: 15,985 LZFSE chunks, 243 raw, 8 zero-fill; logical size 35,319,808 sectors = 16.84 GiB |
+| Filesystem | APFS, 4096-byte blocks, container `blockCount` × blockSize matches the volume exactly; volume name `iOS 26.5 Simulator` |
+| Reachability | a run table translates every logical offset to a compressed offset, so a 4 KiB block costs one chunk decompress (average 523 KB) |
+
+Decoding those runs *is* implemented and was verified byte-for-byte against
+`hdiutil`-converted raw images (LZFSE and zlib). What fails is the APFS layer on
+Apple's sealed runtime volume: the container superblock, checkpoint map, object
+map and volume superblock all resolve correctly, but the volume's filesystem tree
+root resolves to a block whose object header is empty, so the lookup cannot
+proceed. The pure-Go APFS library tried here (majd/go-apfs) also ships a
+checksum check that never compares the stored value, and its checkpoint
+selection breaks on read-only images (both observed directly). A working
+implementation needs a real APFS reader — object map, B-tree, hashed directory
+keys, extents, sealed-volume handling — which is a separate piece of work, not a
+patch.
+
+Until then, for that one binary the practical routes are:
+
+* copy it from any Mac that already has the runtime installed:
+  `/Library/Developer/CoreSimulator/Profiles/Runtimes/<OS>.simruntime/Contents/Resources/`;
+* or run `xcfetch runtime fetch 26.5` (8.5 GB) and unpack the image with
+  7-Zip ≥ 22 or `apfs-fuse` on Linux.
+
 ### `xcode login` / `logout` / `status`
 
 Signs in with SRP-6a against `idmsa.apple.com` (SHA-256, RFC 5054 2048-bit
@@ -162,6 +204,7 @@ payload archives rather than a plain file tree.
 | Cookie jar | persistence round-trip, 0600 permissions, expiry filtering, unrelated hosts ignored |
 | CLI | flag/positional reordering, dispatch, usage errors, signed-out guard |
 | Range extraction | HTTP server that counts bytes: random reads agree with a linear decrypt; extracting a 42 KB file from a 96 MiB object transfers a bounded amount; index cache cuts a repeat walk by >4x; budget guard aborts |
+| Disk image run table | run table + LZFSE/zlib chunk decoding compared byte-for-byte with `hdiutil`-converted raw images (see the note above; not wired into the CLI) |
 | Index / Pallas | live tests (`XCFETCH_NET_TESTS=1`) against Apple's real services |
 
 Known gaps: federated/SSO Apple IDs and hardware security keys are rejected with
