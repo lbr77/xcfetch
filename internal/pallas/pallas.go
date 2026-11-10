@@ -103,7 +103,8 @@ func Query(ctx context.Context, hc *http.Client, assetType, audience, build stri
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "xcfetch/1 (+mobileasset)")
-	resp, err := hc.Do(req)
+	// gdmf.apple.com chains to Apple's own root, absent from Linux CA bundles.
+	resp, err := WithAppleRoots(hc).Do(req)
 	if err != nil {
 		return nil, err
 	}

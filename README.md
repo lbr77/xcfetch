@@ -51,6 +51,9 @@ resolved (`pallas` or `direct`). `--beta` includes betas and seeds,
 1. Resolves the runtime in the index.
 2. For iOS 18+ it asks Pallas for the asset matching the build number, and gets
    the CDN URL, SHA-1/SHA-256 and the AEA symmetric key back.
+   `gdmf.apple.com` presents a chain to Apple Root CA, which macOS trusts but
+   Linux CA bundles do not; xcfetch embeds Apple's roots
+   (`internal/pallas/apple_roots.pem`) and trusts them for Pallas requests only.
 3. Downloads with resume (`Range`), verifying the checksums.
 4. Decrypts AEA and extracts the Apple Archive in one streaming pass (the
    plaintext never hits disk), then unpacks the inner disk image(s).
@@ -239,7 +242,7 @@ payload archives rather than a plain file tree.
 | APFS | hdiutil-built volume (files, modes, symlinks, case-insensitive lookup, 600-entry directory); the real sealed iOS 26.5 image compared byte-for-byte with its mounted copy, seal hashes covering every byte, a flipped byte rejected (`XCFETCH_TEST_RUNTIME_DMG`/`_MOUNT`) |
 | Partial AEA reads | seekable AES-CTR against a linear decrypt (including a counter carry); random reads of an `aea`-encrypted mix of stored and compressed segments; a 16-byte read costs 16 bytes |
 | pbz walk | raw blocks read in place; compressed blocks decoded only as far as needed; inferred headers equal the true index, expensive headers are read only at run ends (a compressed block, the short final block); the live iOS 26.5 index matches a strict walk block for block |
-| Index / Pallas | live tests (`XCFETCH_NET_TESTS=1`) against Apple's real services |
+| Index / Pallas | live tests (`XCFETCH_NET_TESTS=1`) against Apple's real services; embedded Apple roots pinned by fingerprint, added to (not replacing) the client's roots |
 
 Known gaps: federated/SSO Apple IDs and hardware security keys are rejected with
 explicit errors; legacy two-step verification is unsupported; `.pkg`-based
